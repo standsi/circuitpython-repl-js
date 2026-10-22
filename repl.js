@@ -342,6 +342,10 @@ class InputBuffer {
         return result;
     }
 
+    getRemainingByteCount() {
+        return this._buffer.length - this._pointer;
+    }
+
     readExactly(byteCount) {
         let bytes = this._buffer.slice(this._pointer, this._pointer + byteCount);
         this._pointer += byteCount;
@@ -409,7 +413,8 @@ export class REPL {
         this._promptCheckPointer = 0; // Used for looking at prompt output/control characters
         this._checkpointCount = 0;
         this._rawByteCount = 0;
-        this._partialToken = null;
+        this._partialToken = "";
+        this._partialTokenTimeoutId = null;
         this.terminalOutput = true;
     }
 
@@ -452,10 +457,37 @@ export class REPL {
         return string.split(tokenRegex);
     }
 
-    // Check if a chunk of data has a partial title start/end character sequence at the end
-    _hasPartialToken(chunk) {
-        const partialToken = /\\x1b(?:\](?:0"?)?)?$/gi;
-        return partialToken.test(chunk);
+    // Return the longest suffix that could be the beginning of a title
+    // delimiter. Only this suffix needs to be held for the next serial chunk.
+    _getPartialTokenSuffix(data) {
+        const maxLength = Math.max(CHAR_TITLE_START.length, CHAR_TITLE_END.length) - 1;
+        for (let length = Math.min(maxLength, data.length); length > 0; length--) {
+            const suffix = data.slice(-length);
+            if (CHAR_TITLE_START.startsWith(suffix) || CHAR_TITLE_END.startsWith(suffix)) {
+                return suffix;
+            }
+        }
+        return "";
+    }
+
+    _clearPartialTokenTimeout() {
+        if (this._partialTokenTimeoutId !== null) {
+            clearTimeout(this._partialTokenTimeoutId);
+            this._partialTokenTimeoutId = null;
+        }
+    }
+
+    _schedulePartialTokenFlush() {
+        this._partialTokenTimeoutId = setTimeout(() => {
+            this._partialTokenTimeoutId = null;
+            if (!this._partialToken) {
+                return;
+            }
+
+            this._tokenQueue.push(this._partialToken);
+            this._partialToken = "";
+            this._processQueuedTokens();
+        }, PARTIAL_TOKEN_TIMEOUT);
     }
 
     _parseTitleInfo(regex) {
@@ -538,7 +570,12 @@ export class REPL {
     }
 
     async _checkCodeRunning() {
-        await this._detectCurrentMode();
+        // Raw REPL responses are framed as OK, stdout, Ctrl-D, stderr,
+        // Ctrl-D, and a final prompt. While receiving that frame, printable
+        // output such as ">>> " must not be interpreted as a mode change.
+        if (this._mode != MODE_RAW) {
+            await this._detectCurrentMode();
+        }
         if (DEBUG) {
             console.log("Checking if code is running in " + modes[this._mode]);
         }
@@ -549,6 +586,13 @@ export class REPL {
             // The next bytes should be 1 of the following:
             // We receive OK, followed by code output, followed by Ctrl-D, followed by error output, followed by Ctrl-D
             // or we receive an error message
+            // Keep a partial OK acknowledgement in the input buffer until the
+            // second byte arrives. Serial receive boundaries may occur between
+            // any two protocol bytes.
+            if (this._checkpointCount == 0 && this._serialInputBuffer.getRemainingByteCount() < 2) {
+                return;
+            }
+
             let bytes = this._serialInputBuffer.getRemainingBuffer();
             this._rawByteCount += bytes.length;
 
@@ -780,18 +824,24 @@ export class REPL {
         let data = e.data;
 
         // Prepend a partial token if it exists
+        this._clearPartialTokenTimeout();
         if (this._partialToken) {
             data = this._partialToken + data;
-            this._partialToken = null;
+            this._partialToken = "";
         }
 
-        // Tokenize the larger string and send to the parent
+        // Retain only an incomplete delimiter suffix. Process any ordinary
+        // output before it immediately so a partial title token cannot make
+        // unrelated output appear truncated.
+        const partialToken = this._getPartialTokenSuffix(data);
+        if (partialToken) {
+            this._partialToken = partialToken;
+            data = data.slice(0, -partialToken.length);
+            this._schedulePartialTokenFlush();
+        }
+
+        // Tokenize the complete data and send it to the parent
         let tokens = this._tokenize(data);
-
-        // Remove any partial tokens and store for the next serial data receive
-        if (tokens.length && this._hasPartialToken(tokens.slice(-1))) {
-            this._partialToken = tokens.pop();
-        }
 
         // Send only full tokens to the token queue
         for (let token of tokens) {
@@ -894,6 +944,94 @@ export class REPL {
 
         await this._exitRawMode();
         return this._codeOutput;
+    }
+
+    // Best-effort request to make CIRCUITPY writable from the REPL by taking
+    // its USB mass-storage drive offline. The underlying CircuitPython API is
+    // intentionally named "unsafe" because host writes in progress can corrupt
+    // the filesystem. Callers are responsible for deciding when it is safe to
+    // use and for restoring the drive when finished.
+    async tryDisableUsbDrive() {
+        const code = `
+try:
+    import storage
+    if hasattr(storage, "unsafe_disable_usb_drive"):
+        storage.unsafe_disable_usb_drive()
+        _disabled = True
+    else:
+        _disabled = False
+except Exception:
+    _disabled = False
+print("USB_DRIVE_DISABLED", _disabled)
+`;
+        const output = await this.runCode(code);
+        return /USB_DRIVE_DISABLED\s+True/.test(output || "");
+    }
+
+    // Reverse a successful tryDisableUsbDrive() call. Returns false when the
+    // firmware does not support changing USB mass storage after startup or the
+    // operation otherwise fails.
+    async enableUsbDrive() {
+        const code = `
+try:
+    import storage
+    storage.enable_usb_drive()
+    _enabled = True
+except Exception:
+    _enabled = False
+print("USB_DRIVE_ENABLED", _enabled)
+`;
+        const output = await this.runCode(code);
+        return /USB_DRIVE_ENABLED\s+True/.test(output || "");
+    }
+
+    // Snapshot of the board's runtime state in a single round trip.
+    // Returns { readOnly, usbConnected }. Each field is null when the
+    // underlying CircuitPython attribute isn't available or the probe failed.
+    async getRuntimeStatus() {
+        const code = `
+try:
+    import storage
+    _ro = storage.getmount("/").readonly
+except Exception:
+    _ro = None
+try:
+    import supervisor
+    _usb = supervisor.runtime.usb_connected
+except Exception:
+    _usb = None
+print("RUNTIME_STATUS", _ro, _usb)
+`;
+        const output = await this.runCode(code);
+        const match = (output || "").match(/RUNTIME_STATUS\s+(\S+)\s+(\S+)/);
+        if (!match) {
+            return { readOnly: null, usbConnected: null };
+        }
+        return {
+            readOnly: this._parsePyBoolOrNone(match[1]),
+            usbConnected: this._parsePyBoolOrNone(match[2]),
+        };
+    }
+
+    // Best-effort classification of why the filesystem is read-only:
+    //   "not-readonly" - filesystem is writable
+    //   "usb-claim"    - host has CIRCUITPY mounted via USB MSC
+    //   "boot-py"      - read-only without USB; boot.py likely didn't remount
+    //   "hardware"     - read-only with no detectable software cause
+    //   "unknown"      - probe couldn't determine the readonly state
+    async getReadOnlyReason() {
+        const { readOnly, usbConnected } = await this.getRuntimeStatus();
+        if (readOnly === false) return "not-readonly";
+        if (readOnly === null) return "unknown";
+        if (usbConnected === true) return "usb-claim";
+        if (usbConnected === false) return "boot-py";
+        return "hardware";
+    }
+
+    _parsePyBoolOrNone(token) {
+        if (token === "True") return true;
+        if (token === "False") return false;
+        return null;
     }
 
     getCodeOutput() {
